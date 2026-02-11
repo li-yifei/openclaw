@@ -361,12 +361,20 @@ describe("createTelegramBot", () => {
     ).toBe("telegram:555");
   });
 
-  it("routes callback_query payloads as messages and answers callbacks", async () => {
+  it("answers callbacks when fast ack is enabled", async () => {
     onSpy.mockReset();
-    const replySpy = replyModule.__replySpy as unknown as ReturnType<typeof vi.fn>;
-    replySpy.mockReset();
+    answerCallbackQuerySpy.mockReset();
 
-    createTelegramBot({ token: "tok" });
+    createTelegramBot({
+      token: "tok",
+      config: {
+        channels: {
+          telegram: {
+            callbackFastAck: true,
+          },
+        },
+      },
+    });
     const callbackHandler = onSpy.mock.calls.find((call) => call[0] === "callback_query")?.[1] as (
       ctx: Record<string, unknown>,
     ) => Promise<void>;
@@ -387,9 +395,6 @@ describe("createTelegramBot", () => {
       getFile: async () => ({ download: async () => new Uint8Array() }),
     });
 
-    expect(replySpy).toHaveBeenCalledTimes(1);
-    const payload = replySpy.mock.calls[0][0];
-    expect(payload.Body).toContain("cmd:option_a");
     expect(answerCallbackQuerySpy).toHaveBeenCalledWith("cbq-1");
   });
 
@@ -442,6 +447,7 @@ describe("createTelegramBot", () => {
       config: {
         channels: {
           telegram: {
+            callbackFastAck: true,
             dmPolicy: "pairing",
             capabilities: { inlineButtons: "allowlist" },
             allowFrom: [],

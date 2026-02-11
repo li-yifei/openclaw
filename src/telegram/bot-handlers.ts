@@ -285,8 +285,8 @@ export const registerTelegramHandlers = ({
       return;
     }
     // Answer immediately to prevent Telegram from retrying while we process.
-    // Can be disabled via channels.telegram.callbackFastAck (default: true).
-    const callbackFastAck = telegramCfg.callbackFastAck ?? true;
+    // Can be enabled via channels.telegram.callbackFastAck (default: false).
+    const callbackFastAck = telegramCfg.callbackFastAck ?? false;
     if (callbackFastAck) {
       try {
         await bot.api.answerCallbackQuery(callback.id);

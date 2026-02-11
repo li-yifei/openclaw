@@ -132,7 +132,7 @@ export type TelegramAccountConfig = {
   linkPreview?: boolean;
   /**
    * Fast-acknowledge callback queries immediately to avoid Telegram retry storms while processing.
-   * Default: true.
+   * Default: false.
    */
   callbackFastAck?: boolean;
   /**
