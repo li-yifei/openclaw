@@ -131,6 +131,11 @@ export type TelegramAccountConfig = {
   /** Controls whether link previews are shown in outbound messages. Default: true. */
   linkPreview?: boolean;
   /**
+   * Fast-acknowledge callback queries immediately to avoid Telegram retry storms while processing.
+   * Default: true.
+   */
+  callbackFastAck?: boolean;
+  /**
    * Per-channel outbound response prefix override.
    *
    * When set, this takes precedence over the global `messages.responsePrefix`.

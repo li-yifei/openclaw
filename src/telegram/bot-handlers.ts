@@ -284,12 +284,18 @@ export const registerTelegramHandlers = ({
     if (shouldSkipUpdate(ctx)) {
       return;
     }
-    // Answer immediately to prevent Telegram from retrying while we process
-    await withTelegramApiErrorLogging({
-      operation: "answerCallbackQuery",
-      runtime,
-      fn: () => bot.api.answerCallbackQuery(callback.id),
-    }).catch(() => {});
+    // Answer immediately to prevent Telegram from retrying while we process.
+    // Can be disabled via channels.telegram.callbackFastAck (default: true).
+    const callbackFastAck = telegramCfg.callbackFastAck ?? true;
+    if (callbackFastAck) {
+      try {
+        await bot.api.answerCallbackQuery(callback.id);
+      } catch (err) {
+        runtime.log?.(
+          warn(`telegram answerCallbackQuery fast-ack failed (continuing): ${String(err)}`),
+        );
+      }
+    }
     try {
       const data = (callback.data ?? "").trim();
       const callbackMessage = callback.message;
