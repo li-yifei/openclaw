@@ -1,20 +1,18 @@
-import type { ApiClientOptions } from "grammy";
 import { sequentialize } from "@grammyjs/runner";
 import { apiThrottler } from "@grammyjs/transformer-throttler";
-import { type Message, type UserFromGetMe, ReactionTypeEmoji } from "@grammyjs/types";
+import { type Message, type UserFromGetMe } from "@grammyjs/types";
+import type { ApiClientOptions } from "grammy";
 import { Bot, webhookCallback } from "grammy";
-import type { OpenClawConfig, ReplyToMode } from "../config/config.js";
-import type { RuntimeEnv } from "../runtime.js";
-import type { TelegramContext } from "./bot/types.js";
 import { resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { resolveTextChunkLimit } from "../auto-reply/chunk.js";
-import { isControlCommandMessage } from "../auto-reply/command-detection.js";
+import { isAbortRequestText } from "../auto-reply/reply/abort.js";
 import { DEFAULT_GROUP_HISTORY_LIMIT, type HistoryEntry } from "../auto-reply/reply/history.js";
 import {
   isNativeCommandsExplicitlyDisabled,
   resolveNativeCommandsEnabled,
   resolveNativeSkillsEnabled,
 } from "../config/commands.js";
+import type { OpenClawConfig, ReplyToMode } from "../config/config.js";
 import { loadConfig } from "../config/config.js";
 import {
   resolveChannelGroupPolicy,
@@ -23,12 +21,10 @@ import {
 import { loadSessionStore, resolveStorePath } from "../config/sessions.js";
 import { danger, logVerbose, shouldLogVerbose } from "../globals.js";
 import { formatUncaughtError } from "../infra/errors.js";
-import { enqueueSystemEvent } from "../infra/system-events.js";
 import { getChildLogger } from "../logging.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
-import { resolveAgentRoute } from "../routing/resolve-route.js";
+import type { RuntimeEnv } from "../runtime.js";
 import { resolveTelegramAccount } from "./accounts.js";
-import { withTelegramApiErrorLogging } from "./api-logging.js";
 import { registerTelegramHandlers } from "./bot-handlers.js";
 import { createTelegramMessageProcessor } from "./bot-message.js";
 import { registerTelegramNativeCommands } from "./bot-native-commands.js";
@@ -40,12 +36,10 @@ import {
 } from "./bot-updates.js";
 import {
   buildTelegramGroupPeerId,
-  buildTelegramParentPeer,
   resolveTelegramForumThreadId,
   resolveTelegramStreamMode,
 } from "./bot/helpers.js";
 import { resolveTelegramFetch } from "./fetch.js";
-import { wasSentByBot } from "./sent-message-cache.js";
 
 export type TelegramBotOptions = {
   token: string;
@@ -62,15 +56,23 @@ export type TelegramBotOptions = {
     lastUpdateId?: number | null;
     onUpdateId?: (updateId: number) => void | Promise<void>;
   };
+  testTimings?: {
+    mediaGroupFlushMs?: number;
+    textFragmentGapMs?: number;
+  };
 };
 
 export function getTelegramSequentialKey(ctx: {
   chat?: { id?: number };
   me?: UserFromGetMe;
   message?: Message;
+  channelPost?: Message;
+  editedChannelPost?: Message;
   update?: {
     message?: Message;
     edited_message?: Message;
+    channel_post?: Message;
+    edited_channel_post?: Message;
     callback_query?: { message?: Message };
     message_reaction?: { chat?: { id?: number } };
   };
@@ -82,16 +84,17 @@ export function getTelegramSequentialKey(ctx: {
   }
   const msg =
     ctx.message ??
+    ctx.channelPost ??
+    ctx.editedChannelPost ??
     ctx.update?.message ??
     ctx.update?.edited_message ??
+    ctx.update?.channel_post ??
+    ctx.update?.edited_channel_post ??
     ctx.update?.callback_query?.message;
   const chatId = msg?.chat?.id ?? ctx.chat?.id;
   const rawText = msg?.text ?? msg?.caption;
   const botUsername = ctx.me?.username;
-  if (
-    rawText &&
-    isControlCommandMessage(rawText, undefined, botUsername ? { botUsername } : undefined)
-  ) {
+  if (isAbortRequestText(rawText, botUsername ? { botUsername } : undefined)) {
     if (typeof chatId === "number") {
       return `telegram:${chatId}:control`;
     }
@@ -183,9 +186,34 @@ export function createTelegramBot(opts: TelegramBotOptions) {
   };
 
   const rawUpdateLogger = createSubsystemLogger("gateway/channels/telegram/raw-update");
+  const tapInterceptLogger = createSubsystemLogger("gateway/channels/telegram/callback-tap");
+  const callbackTapInterceptEnabled = telegramCfg.callback?.tapIntercept === true;
   const MAX_RAW_UPDATE_CHARS = 8000;
   const MAX_RAW_UPDATE_STRING = 500;
   const MAX_RAW_UPDATE_ARRAY = 20;
+  const sanitizeDataPrefix = (value: unknown, max = 48) => {
+    if (typeof value !== "string") {
+      return "";
+    }
+    const compact = value.replace(/[\r\n\t]+/g, " ").trim();
+    return compact.slice(0, max);
+  };
+  const resolveUpdateType = (
+    update:
+      | {
+          callback_query?: unknown;
+          message?: unknown;
+        }
+      | undefined,
+  ) => {
+    if (update?.callback_query) {
+      return "callback_query";
+    }
+    if (update?.message) {
+      return "message";
+    }
+    return "other";
+  };
   const stringifyUpdate = (update: unknown) => {
     const seen = new WeakSet();
     return JSON.stringify(update ?? null, (key, value) => {
@@ -209,6 +237,39 @@ export function createTelegramBot(opts: TelegramBotOptions) {
   };
 
   bot.use(async (ctx, next) => {
+    const updateType = resolveUpdateType(ctx.update);
+
+    if (callbackTapInterceptEnabled) {
+      try {
+        if (updateType === "callback_query") {
+          const callback = ctx.update?.callback_query;
+          const chatId = callback?.message?.chat?.id ?? callback?.from?.id ?? "unknown";
+          const messageId = callback?.message?.message_id ?? "unknown";
+          const dataPrefix = sanitizeDataPrefix(callback?.data);
+          tapInterceptLogger.debug(
+            `tap-intercept hit type=callback_query chatId=${String(chatId)} messageId=${String(messageId)} dataPrefix=${JSON.stringify(dataPrefix)}`,
+          );
+          // Tap intercept answers the callback immediately so Telegram does not retry.
+          // The downstream handler in bot-handlers.ts skips its own answerCallbackQuery
+          // when tapIntercept is enabled to avoid a double-answer race.
+          if (callback?.id) {
+            const callbackData = typeof callback.data === "string" ? callback.data.trim() : "";
+            const isSentinel = callbackData.startsWith("ocb:clicked:");
+            const ackText = telegramCfg.callback?.ackText;
+            const ackAlert = telegramCfg.callback?.ackAlert;
+            // Don't show ackText toast for already-disabled (sentinel) buttons — misleading UX.
+            const ackParams =
+              !isSentinel && (typeof ackText === "string" || typeof ackAlert === "boolean")
+                ? { text: ackText, show_alert: ackAlert }
+                : undefined;
+            await bot.api.answerCallbackQuery(callback.id, ackParams).catch(() => {});
+          }
+        }
+      } catch (err) {
+        tapInterceptLogger.debug(`tap-intercept failed: ${String(err)}`);
+      }
+    }
+
     if (shouldLogVerbose()) {
       try {
         const raw = stringifyUpdate(ctx.update);
@@ -240,7 +301,7 @@ export function createTelegramBot(opts: TelegramBotOptions) {
       ? telegramCfg.allowFrom
       : undefined) ??
     (opts.allowFrom && opts.allowFrom.length > 0 ? opts.allowFrom : undefined);
-  const replyToMode = opts.replyToMode ?? telegramCfg.replyToMode ?? "first";
+  const replyToMode = opts.replyToMode ?? telegramCfg.replyToMode ?? "off";
   const nativeEnabled = resolveNativeCommandsEnabled({
     providerId: "telegram",
     providerSetting: telegramCfg.commands?.native,
@@ -260,32 +321,6 @@ export function createTelegramBot(opts: TelegramBotOptions) {
   const mediaMaxBytes = (opts.mediaMaxMb ?? telegramCfg.mediaMaxMb ?? 5) * 1024 * 1024;
   const logger = getChildLogger({ module: "telegram-auto-reply" });
   const streamMode = resolveTelegramStreamMode(telegramCfg);
-  let botHasTopicsEnabled: boolean | undefined;
-  const resolveBotTopicsEnabled = async (ctx?: TelegramContext) => {
-    if (typeof ctx?.me?.has_topics_enabled === "boolean") {
-      botHasTopicsEnabled = ctx.me.has_topics_enabled;
-      return botHasTopicsEnabled;
-    }
-    if (typeof botHasTopicsEnabled === "boolean") {
-      return botHasTopicsEnabled;
-    }
-    if (typeof bot.api.getMe !== "function") {
-      botHasTopicsEnabled = false;
-      return botHasTopicsEnabled;
-    }
-    try {
-      const me = await withTelegramApiErrorLogging({
-        operation: "getMe",
-        runtime,
-        fn: () => bot.api.getMe(),
-      });
-      botHasTopicsEnabled = Boolean(me?.has_topics_enabled);
-    } catch (err) {
-      logVerbose(`telegram getMe failed: ${String(err)}`);
-      botHasTopicsEnabled = false;
-    }
-    return botHasTopicsEnabled;
-  };
   const resolveGroupPolicy = (chatId: string | number) =>
     resolveChannelGroupPolicy({
       cfg,
@@ -359,7 +394,6 @@ export function createTelegramBot(opts: TelegramBotOptions) {
     streamMode,
     textLimit,
     opts,
-    resolveBotTopicsEnabled,
   });
 
   registerTelegramNativeCommands({
@@ -380,98 +414,6 @@ export function createTelegramBot(opts: TelegramBotOptions) {
     resolveTelegramGroupConfig,
     shouldSkipUpdate,
     opts,
-  });
-
-  // Handle emoji reactions to messages
-  bot.on("message_reaction", async (ctx) => {
-    try {
-      const reaction = ctx.messageReaction;
-      if (!reaction) {
-        return;
-      }
-      if (shouldSkipUpdate(ctx)) {
-        return;
-      }
-
-      const chatId = reaction.chat.id;
-      const messageId = reaction.message_id;
-      const user = reaction.user;
-
-      // Resolve reaction notification mode (default: "own")
-      const reactionMode = telegramCfg.reactionNotifications ?? "own";
-      if (reactionMode === "off") {
-        return;
-      }
-      if (user?.is_bot) {
-        return;
-      }
-      if (reactionMode === "own" && !wasSentByBot(chatId, messageId)) {
-        return;
-      }
-
-      // Detect added reactions
-      const oldEmojis = new Set(
-        reaction.old_reaction
-          .filter((r): r is ReactionTypeEmoji => r.type === "emoji")
-          .map((r) => r.emoji),
-      );
-      const addedReactions = reaction.new_reaction
-        .filter((r): r is ReactionTypeEmoji => r.type === "emoji")
-        .filter((r) => !oldEmojis.has(r.emoji));
-
-      if (addedReactions.length === 0) {
-        return;
-      }
-
-      // Build sender label
-      const senderName = user
-        ? [user.first_name, user.last_name].filter(Boolean).join(" ").trim() || user.username
-        : undefined;
-      const senderUsername = user?.username ? `@${user.username}` : undefined;
-      let senderLabel = senderName;
-      if (senderName && senderUsername) {
-        senderLabel = `${senderName} (${senderUsername})`;
-      } else if (!senderName && senderUsername) {
-        senderLabel = senderUsername;
-      }
-      if (!senderLabel && user?.id) {
-        senderLabel = `id:${user.id}`;
-      }
-      senderLabel = senderLabel || "unknown";
-
-      // Reactions target a specific message_id; the Telegram Bot API does not include
-      // message_thread_id on MessageReactionUpdated, so we route to the chat-level
-      // session (forum topic routing is not available for reactions).
-      const isGroup = reaction.chat.type === "group" || reaction.chat.type === "supergroup";
-      const isForum = reaction.chat.is_forum === true;
-      const resolvedThreadId = isForum
-        ? resolveTelegramForumThreadId({ isForum, messageThreadId: undefined })
-        : undefined;
-      const peerId = isGroup ? buildTelegramGroupPeerId(chatId, resolvedThreadId) : String(chatId);
-      const parentPeer = buildTelegramParentPeer({ isGroup, resolvedThreadId, chatId });
-      // Fresh config for bindings lookup; other routing inputs are payload-derived.
-      const route = resolveAgentRoute({
-        cfg: loadConfig(),
-        channel: "telegram",
-        accountId: account.accountId,
-        peer: { kind: isGroup ? "group" : "direct", id: peerId },
-        parentPeer,
-      });
-      const sessionKey = route.sessionKey;
-
-      // Enqueue system event for each added reaction
-      for (const r of addedReactions) {
-        const emoji = r.emoji;
-        const text = `Telegram reaction added: ${emoji} by ${senderLabel} on msg ${messageId}`;
-        enqueueSystemEvent(text, {
-          sessionKey: sessionKey,
-          contextKey: `telegram:reaction:add:${chatId}:${messageId}:${user?.id ?? "anon"}:${emoji}`,
-        });
-        logVerbose(`telegram: reaction event enqueued: ${text}`);
-      }
-    } catch (err) {
-      runtime.error?.(danger(`telegram reaction handler failed: ${String(err)}`));
-    }
   });
 
   registerTelegramHandlers({
